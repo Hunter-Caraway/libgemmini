@@ -21,6 +21,15 @@ static const uint64_t addr_len = ADDR_LEN; // Number of bits used to address the
 #define NUM_COUNTERS 8
 #define NUM_EXTERNAL_COUNTERS 6 
 
+// n:m sparsity pattern for the sparse weight-stationary mode
+// changed: added, defaults to 2:4, hardware needs m == 2*n
+#ifndef NM_N
+#define NM_N 2
+#endif
+#ifndef NM_M
+#define NM_M 4
+#endif
+
 #define MAKECUSTOMFN(opcode) custom ## opcode
 #define CUSTOMFN(opcode) MAKECUSTOMFN(opcode)
 
@@ -107,6 +116,14 @@ struct gemmini_state_t
   std::vector<std::vector<acc_t>> pe_state; // Stores each PE's internal accumulator state
   std::vector<std::vector<acc_t>> accumulator;
 
+  // n:m sparse mode stuff
+  // changed: added. nm_meta is the staging buffer filled by the meta cmd,
+  // pe_meta is what the pes actually hold after a preload
+  bool nm_sparse;
+  std::vector<std::vector<uint8_t>> nm_meta;
+  std::vector<std::vector<uint8_t>> pe_meta;
+  size_t nm_meta_wp;
+
   // cisc state
   reg_t a_addr, b_addr, c_addr, d_addr;
   reg_t m, n, k;
@@ -129,6 +146,7 @@ public:
   void config(reg_t rs1, reg_t rs2);
   void compute(reg_t a_addr, reg_t bd_addr, bool preload);
   void compute_cisc();
+  void nm_meta_load(reg_t rs1, reg_t rs2); // changed: added
   reg_t counter_operation(reg_t rs1);
 
   void loop_ws(reg_t rs1, reg_t rs2);
@@ -164,6 +182,7 @@ private:
   const unsigned compute_accumulated_funct = 5;
   const unsigned preload_funct = 6;
   const unsigned flush_funct = 7;
+  const unsigned nm_meta_funct = 26; // changed: added, loads n:m index rows
   const unsigned loop_ws_funct = 8;
   const unsigned loop_ws_config_bounds_funct = 9;
   const unsigned loop_ws_config_addrs_AB_funct = 10;

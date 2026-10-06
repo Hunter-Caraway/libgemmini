@@ -31,6 +31,14 @@ void gemmini_state_t::reset()
   pe_state.clear();
   pe_state.resize(DIM, std::vector<acc_t>(DIM));
 
+  // changed: reset the n:m sparse state too
+  nm_sparse = false;
+  nm_meta.clear();
+  nm_meta.resize(DIM, std::vector<uint8_t>(DIM));
+  pe_meta.clear();
+  pe_meta.resize(DIM, std::vector<uint8_t>(DIM));
+  nm_meta_wp = 0;
+
   accumulator.clear();
   accumulator.resize(accum_rows, std::vector<acc_t>(DIM, 0));
 
@@ -409,6 +417,7 @@ void gemmini_t::config(reg_t rs1, reg_t rs2) {
     new_b_transpose = (rs1 >> 9) & 0x1;
 
     const bool set_only_strides = (rs1 >> 7) & 0x1;
+    const bool new_nm_sparse = (rs1 >> 10) & 0x1; // changed: rs1[10] turns on n:m sparse mode
 
     dprintf("GEMMINI: config_ex - set dataflow mode from %d to %d\n", gemmini_state.mode, new_mode);
     dprintf("GEMMINI: config_ex - set activation function from %d to %d\n", gemmini_state.sys_act, new_act);
@@ -424,7 +433,11 @@ void gemmini_t::config(reg_t rs1, reg_t rs2) {
       gemmini_state.sys_acc_shift = new_sys_acc_shift;
       gemmini_state.a_transpose = new_a_transpose;
       gemmini_state.b_transpose = new_b_transpose;
+      gemmini_state.nm_sparse = new_nm_sparse; // changed: added
     }
+
+    // changed: sparse mode only makes sense in ws, and no transposes
+    assert(!gemmini_state.nm_sparse || (gemmini_state.mode == gemmini_state_t::WS && !gemmini_state.a_transpose && !gemmini_state.b_transpose));
 
     gemmini_state.c_stride = new_c_stride;
     gemmini_state.a_stride = new_a_stride;
@@ -532,6 +545,11 @@ void gemmini_t::compute(reg_t a_addr, reg_t bd_addr, bool preload) {
            "scratchpad B addr 0x%08x\n", preload, a_addr_real, bd_addr_real);
 
   // Preload
+  if (preload && gemmini_state.nm_sparse) {
+    // changed: sparse preload grabs whatever index rows were staged and resets the write pointer
+    gemmini_state.pe_meta = gemmini_state.nm_meta;
+    gemmini_state.nm_meta_wp = 0;
+  }
   if (preload) {
     dprintf("GEMMINI: compute - PEs after preloading:\n");
     for (size_t i = 0; i < DIM; i++) {
@@ -570,48 +588,76 @@ void gemmini_t::compute(reg_t a_addr, reg_t bd_addr, bool preload) {
   // For OS, accumulate the PE results internally in pe_state
   // For WS, allocate a new results array which won't affect pe_state, seed the results array with the bias (D) matrix
   auto results = std::vector<std::vector<acc_t>>(DIM, std::vector<acc_t>(DIM));
-  for (size_t i = 0; i < DIM; ++i) {
-    for (size_t j = 0; j < DIM; ++j) {
-      if (i < bd_rows && j < bd_cols) {
-        results.at(i).at(j) = (~bd_addr_real == 0) ? 0 : gemmini_state.spad.at(bd_addr_real + i).at(j);
-      } else {
-        results.at(i).at(j) = 0;
+  if (gemmini_state.nm_sparse) {
+    // changed: n:m sparse ws compute
+    // a comes in as one dense row 2*DIM wide, split over two spad rows:
+    // a_addr holds cols 0..DIM-1 and bd_addr holds cols DIM..2*DIM-1 (no bias in this mode).
+    // pe row r holds a squashed weight from group r/n, its idx picks which of the
+    // m activations in that group it multiplies with
+    for (size_t i = 0; i < DIM; ++i) {
+      for (size_t j = 0; j < DIM; ++j) {
+        acc_t sum = 0;
+        for (size_t r = 0; r < DIM; ++r) {
+          const size_t g = r / NM_N;
+          const size_t kd = g * NM_M + gemmini_state.pe_meta.at(r).at(j);
+          const size_t row = gemmini_state.a_stride * i;
+          elem_t a = 0;
+          if (kd < DIM) {
+            if (~a_addr_real != 0 && i < a_rows && kd < a_cols)
+              a = gemmini_state.spad.at(a_addr_real + row).at(kd);
+          } else {
+            if (~bd_addr_real != 0 && i < bd_rows && kd - DIM < bd_cols)
+              a = gemmini_state.spad.at(bd_addr_real + row).at(kd - DIM);
+          }
+          sum += a * gemmini_state.pe_state.at(r).at(j);
+        }
+        results.at(i).at(j) = sum;
       }
     }
-  }
-
-  for (size_t i = 0; i < DIM; ++i) {
-    for (size_t j = 0; j < DIM; ++j) {
-      for (size_t k = 0; k < DIM; ++k) {
-        elem_t a;
-        if (~a_addr_real != 0) {
-            const size_t r = gemmini_state.a_stride * (gemmini_state.a_transpose ? k : i);
-            const size_t c = gemmini_state.a_transpose ? i : k;
-
-            a = i < a_rows && k < a_cols ? gemmini_state.spad.at(a_addr_real + r).at(c) : 0;
-        }
-
-        if (gemmini_state.mode == gemmini_state_t::WS) {
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-          results.at(i).at(j) += a * gemmini_state.pe_state.at(k).at(j);
-#pragma GCC diagnostic pop
+  } else {
+    for (size_t i = 0; i < DIM; ++i) {
+      for (size_t j = 0; j < DIM; ++j) {
+        if (i < bd_rows && j < bd_cols) {
+          results.at(i).at(j) = (~bd_addr_real == 0) ? 0 : gemmini_state.spad.at(bd_addr_real + i).at(j);
         } else {
-          elem_t b = 0;
-          if (~bd_addr_real != 0) {
-            const size_t r = gemmini_state.b_transpose ? j : k;
-            const size_t c = gemmini_state.b_transpose ? k : j;
+          results.at(i).at(j) = 0;
+        }
+      }
+    }
 
-            b = k < bd_rows && j < bd_cols ? gemmini_state.spad.at(bd_addr_real + r).at(c) : 0;
+    for (size_t i = 0; i < DIM; ++i) {
+      for (size_t j = 0; j < DIM; ++j) {
+        for (size_t k = 0; k < DIM; ++k) {
+          elem_t a;
+          if (~a_addr_real != 0) {
+              const size_t r = gemmini_state.a_stride * (gemmini_state.a_transpose ? k : i);
+              const size_t c = gemmini_state.a_transpose ? i : k;
+
+              a = i < a_rows && k < a_cols ? gemmini_state.spad.at(a_addr_real + r).at(c) : 0;
           }
 
-          gemmini_state.pe_state.at(i).at(j) += a * b;
+          if (gemmini_state.mode == gemmini_state_t::WS) {
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+            results.at(i).at(j) += a * gemmini_state.pe_state.at(k).at(j);
+#pragma GCC diagnostic pop
+          } else {
+            elem_t b = 0;
+            if (~bd_addr_real != 0) {
+              const size_t r = gemmini_state.b_transpose ? j : k;
+              const size_t c = gemmini_state.b_transpose ? k : j;
+
+              b = k < bd_rows && j < bd_cols ? gemmini_state.spad.at(bd_addr_real + r).at(c) : 0;
+            }
+
+            gemmini_state.pe_state.at(i).at(j) += a * b;
+          }
         }
       }
     }
   }
 
-  dprintf("GEMMINI: compute - PEs after matmul:\n");
+dprintf("GEMMINI: compute - PEs after matmul:\n");
   for (size_t i = 0; i < DIM; ++i) {
     for (size_t j = 0; j < DIM; ++j) {
 #ifdef ELEM_T_IS_FLOAT
@@ -665,6 +711,32 @@ void gemmini_t::compute(reg_t a_addr, reg_t bd_addr, bool preload) {
       dprintf("\n");
     }
   }
+}
+
+// changed: added. stages n:m index rows for the next sparse preload.
+// each index is log2(m) bits, a row is DIM of them packed low col first,
+// each 64 bit reg holds as many whole rows as fit, rs1 rows go first then rs2.
+// rows land at the write pointer which walks forward each cmd
+void gemmini_t::nm_meta_load(reg_t rs1, reg_t rs2) {
+  size_t idx_bits = 0;
+  while ((1u << idx_bits) < NM_M) idx_bits++;
+  const size_t row_bits = DIM * idx_bits;
+  assert(row_bits <= 64);
+  const size_t rows_per_reg = 64 / row_bits;
+  const reg_t idx_mask = (1u << idx_bits) - 1;
+
+  const reg_t regs[2] = {rs1, rs2};
+  for (int ri = 0; ri < 2; ri++) {
+    for (size_t q = 0; q < rows_per_reg; q++) {
+      const size_t r = gemmini_state.nm_meta_wp++;
+      if (r >= DIM) continue;
+      for (size_t c = 0; c < DIM; c++) {
+        const size_t bit = q * row_bits + c * idx_bits;
+        gemmini_state.nm_meta.at(r).at(c) = (regs[ri] >> bit) & idx_mask;
+      }
+    }
+  }
+  dprintf("GEMMINI: nm_meta - write pointer now %lu\n", gemmini_state.nm_meta_wp);
 }
 
 void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
@@ -1595,6 +1667,8 @@ reg_t gemmini_t::CUSTOMFN(XCUSTOM_ACC)(rocc_insn_t insn, reg_t xs1, reg_t xs2) {
     loop_conv_ws_config_6(xs1, xs2);
   } else if (insn.funct == loop_conv_ws_funct) {
     loop_conv_ws(xs1, xs2);
+  } else if (insn.funct == nm_meta_funct) { // changed: added
+    nm_meta_load(xs1, xs2);
   } else if (insn.funct == counter_op_funct) {
     return counter_operation(xs1);
   }
