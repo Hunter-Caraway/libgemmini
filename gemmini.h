@@ -122,6 +122,7 @@ struct gemmini_state_t
   bool nm_sparse;
   std::vector<std::vector<uint8_t>> nm_meta;
   std::vector<std::vector<uint8_t>> pe_meta;
+  std::vector<std::vector<uint8_t>> preload_meta; // changed: what the last preload cmd grabbed
   size_t nm_meta_wp;
 
   // cisc state

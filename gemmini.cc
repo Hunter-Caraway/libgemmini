@@ -37,6 +37,8 @@ void gemmini_state_t::reset()
   nm_meta.resize(DIM, std::vector<uint8_t>(DIM));
   pe_meta.clear();
   pe_meta.resize(DIM, std::vector<uint8_t>(DIM));
+  preload_meta.clear();
+  preload_meta.resize(DIM, std::vector<uint8_t>(DIM));
   nm_meta_wp = 0;
 
   accumulator.clear();
@@ -377,6 +379,13 @@ void gemmini_t::preload(reg_t bd_addr, reg_t c_addr) {
 
   dprintf("GEMMINI: preload - scratchpad output addr = 0x%08x, scratchpad preload addr = 0x%08x\n",
             gemmini_state.output_sp_addr, gemmini_state.preload_sp_addr);
+
+  // changed: the preload cmd is what eats the staged indexes (matches the rtl), so meta
+  // for the next tile can be sent before the compute that goes with this preload
+  if (gemmini_state.nm_sparse) {
+    gemmini_state.preload_meta = gemmini_state.nm_meta;
+    gemmini_state.nm_meta_wp = 0;
+  }
 }
 
 void gemmini_t::config(reg_t rs1, reg_t rs2) {
@@ -546,9 +555,8 @@ void gemmini_t::compute(reg_t a_addr, reg_t bd_addr, bool preload) {
 
   // Preload
   if (preload && gemmini_state.nm_sparse) {
-    // changed: sparse preload grabs whatever index rows were staged and resets the write pointer
-    gemmini_state.pe_meta = gemmini_state.nm_meta;
-    gemmini_state.nm_meta_wp = 0;
+    // changed: indexes land in the pes together with the weights
+    gemmini_state.pe_meta = gemmini_state.preload_meta;
   }
   if (preload) {
     dprintf("GEMMINI: compute - PEs after preloading:\n");
