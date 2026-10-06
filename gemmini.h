@@ -5,6 +5,7 @@
 #include <riscv/rocc.h>
 #include <random>
 #include <limits>
+#include <deque>
 #include "gemmini_params.h"
 
 typedef acc_t output_t; // Systolic array output datatype (coming down from PEs, moving into accumulator)
@@ -117,13 +118,15 @@ struct gemmini_state_t
   std::vector<std::vector<acc_t>> accumulator;
 
   // n:m sparse mode stuff
-  // changed: added. nm_meta is the staging buffer filled by the meta cmd,
-  // pe_meta is what the pes actually hold after a preload
+  // changed: added. meta cmds fill nm_asm row by row, finished DIM x DIM index tiles go in
+  // nm_meta_q, each real sparse preload pops one (like the rtl fifo).
+  // pe_meta is what the pes hold after a preload
   bool nm_sparse;
-  std::vector<std::vector<uint8_t>> nm_meta;
+  std::vector<std::vector<uint8_t>> nm_asm;
+  size_t nm_asm_row;
+  std::deque<std::vector<std::vector<uint8_t>>> nm_meta_q;
   std::vector<std::vector<uint8_t>> pe_meta;
-  std::vector<std::vector<uint8_t>> preload_meta; // changed: what the last preload cmd grabbed
-  size_t nm_meta_wp;
+  std::vector<std::vector<uint8_t>> preload_meta; // what the last preload cmd grabbed
 
   // cisc state
   reg_t a_addr, b_addr, c_addr, d_addr;

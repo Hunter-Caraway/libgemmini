@@ -33,13 +33,14 @@ void gemmini_state_t::reset()
 
   // changed: reset the n:m sparse state too
   nm_sparse = false;
-  nm_meta.clear();
-  nm_meta.resize(DIM, std::vector<uint8_t>(DIM));
+  nm_asm.clear();
+  nm_asm.resize(DIM, std::vector<uint8_t>(DIM));
+  nm_asm_row = 0;
+  nm_meta_q.clear();
   pe_meta.clear();
   pe_meta.resize(DIM, std::vector<uint8_t>(DIM));
   preload_meta.clear();
   preload_meta.resize(DIM, std::vector<uint8_t>(DIM));
-  nm_meta_wp = 0;
 
   accumulator.clear();
   accumulator.resize(accum_rows, std::vector<acc_t>(DIM, 0));
@@ -380,11 +381,18 @@ void gemmini_t::preload(reg_t bd_addr, reg_t c_addr) {
   dprintf("GEMMINI: preload - scratchpad output addr = 0x%08x, scratchpad preload addr = 0x%08x\n",
             gemmini_state.output_sp_addr, gemmini_state.preload_sp_addr);
 
-  // changed: the preload cmd is what eats the staged indexes (matches the rtl), so meta
-  // for the next tile can be sent before the compute that goes with this preload
+  // changed: a real sparse preload pops one index tile (matches the rtl fifo).
+  // zero/garbage preloads dont touch the fifo
   if (gemmini_state.nm_sparse) {
-    gemmini_state.preload_meta = gemmini_state.nm_meta;
-    gemmini_state.nm_meta_wp = 0;
+    if (~gemmini_state.preload_sp_addr == 0) {
+      for (auto & row : gemmini_state.preload_meta) std::fill(row.begin(), row.end(), 0);
+    } else if (gemmini_state.nm_meta_q.empty()) {
+      fprintf(stderr, "GEMMINI: sparse preload with no index tile queued, the rtl would hang here\n");
+      abort();
+    } else {
+      gemmini_state.preload_meta = gemmini_state.nm_meta_q.front();
+      gemmini_state.nm_meta_q.pop_front();
+    }
   }
 }
 
@@ -721,10 +729,10 @@ dprintf("GEMMINI: compute - PEs after matmul:\n");
   }
 }
 
-// changed: added. stages n:m index rows for the next sparse preload.
+// changed: added. n:m index rows for sparse preloads.
 // each index is log2(m) bits, a row is DIM of them packed low col first,
 // each 64 bit reg holds as many whole rows as fit, rs1 rows go first then rs2.
-// rows land at the write pointer which walks forward each cmd
+// rows fill up one DIM x DIM tile at a time
 void gemmini_t::nm_meta_load(reg_t rs1, reg_t rs2) {
   size_t idx_bits = 0;
   while ((1u << idx_bits) < NM_M) idx_bits++;
@@ -736,15 +744,22 @@ void gemmini_t::nm_meta_load(reg_t rs1, reg_t rs2) {
   const reg_t regs[2] = {rs1, rs2};
   for (int ri = 0; ri < 2; ri++) {
     for (size_t q = 0; q < rows_per_reg; q++) {
-      const size_t r = gemmini_state.nm_meta_wp++;
+      const size_t r = gemmini_state.nm_asm_row + ri * rows_per_reg + q;
       if (r >= DIM) continue;
       for (size_t c = 0; c < DIM; c++) {
         const size_t bit = q * row_bits + c * idx_bits;
-        gemmini_state.nm_meta.at(r).at(c) = (regs[ri] >> bit) & idx_mask;
+        gemmini_state.nm_asm.at(r).at(c) = (regs[ri] >> bit) & idx_mask;
       }
     }
   }
-  dprintf("GEMMINI: nm_meta - write pointer now %lu\n", gemmini_state.nm_meta_wp);
+  // tile done once the rows run off the end, then it waits for a preload
+  if (gemmini_state.nm_asm_row + 2 * rows_per_reg >= DIM) {
+    gemmini_state.nm_meta_q.push_back(gemmini_state.nm_asm);
+    gemmini_state.nm_asm_row = 0;
+  } else {
+    gemmini_state.nm_asm_row += 2 * rows_per_reg;
+  }
+  dprintf("GEMMINI: nm_meta - %lu index tiles queued\n", gemmini_state.nm_meta_q.size());
 }
 
 void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
