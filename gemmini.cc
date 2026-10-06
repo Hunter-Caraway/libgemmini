@@ -52,10 +52,19 @@ void gemmini_state_t::reset()
 
   // Norm reset
   for (int i = 0; i < NORM_STAT_IDS; i++) norm_reset[i] = true;
+  norm_stat_id = 0; // changed: was never initialized, mvout from the acc indexes the norm arrays with it
 
   // Dummy counter reset
   snapshot_enable = false;
   op_in_progress = false;
+  // changed: these were never initialized, the first counter op reads them
+  for (size_t i = 0; i < NUM_COUNTERS; i++) {
+    counter_val[i] = 0;
+    counter_snapshot_val[i] = 0;
+    counter_config[i] = 0;
+    counter_external_flag[i] = false;
+  }
+  for (size_t i = 0; i < NUM_EXTERNAL_COUNTERS; i++) counter_external[i] = 0;
 
   resetted = true;
 
