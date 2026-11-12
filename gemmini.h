@@ -22,13 +22,30 @@ static const uint64_t addr_len = ADDR_LEN; // Number of bits used to address the
 #define NUM_COUNTERS 8
 #define NUM_EXTERNAL_COUNTERS 6 
 
-// n:m sparsity pattern for the sparse weight-stationary mode
-// changed: added, defaults to 2:4, hardware needs m == 2*n
-#ifndef NM_N
-#define NM_N 2
+// changed: added. N:M sparsity pattern of the sparse weight-stationary mode.
+// The Makefile passes -DNM_N/-DNM_M (default 2:4); it must match the chip (GEMMINI_HW_NM_N/M when the header has them).
+#if !defined(NM_N) || !defined(NM_M)
+#error "NM_N/NM_M undefined: build through the Makefile, e.g. make NM_N=4 NM_M=8"
 #endif
-#ifndef NM_M
-#define NM_M 4
+#if defined(GEMMINI_HW_NM_N) && defined(GEMMINI_HW_NM_M) && (GEMMINI_HW_NM_N != NM_N || GEMMINI_HW_NM_M != NM_M)
+#error "NM_N/NM_M disagree with GEMMINI_HW_NM_N/GEMMINI_HW_NM_M in gemmini_params.h"
+#endif
+
+constexpr unsigned nm_log2_ceil(unsigned x) { return x <= 1 ? 0 : 1 + nm_log2_ceil((x + 1) / 2); }
+static_assert(NM_N >= 1 && NM_M == 2 * NM_N, "the sparse array needs m == 2*n");
+static_assert((NM_M & (NM_M - 1)) == 0, "m must be a power of 2");
+static_assert(DIM % NM_N == 0, "DIM must be a multiple of n");
+static_assert(DIM * nm_log2_ceil(NM_M) <= 64, "an index row (DIM * log2(m) bits) must fit in 64 bits");
+
+#define NM_META_FIFO_DEPTH 4 // index tiles the RTL FIFO holds: send at most this many tiles ahead of their preloads
+
+// changed: Fix A. Scratchpad rows one DIM x DIM index tile fills, packed tight (DIM*DIM*log2(m) bits over
+// DIM*8*sizeof(elem_t)-bit rows, rounded up): 4 for 2:4, 6 for 4:8 at DIM 16 int8 (fix-a-spec.md section 3).
+#define NM_SPAD_ROWS_PER_TILE_CALC ((DIM * DIM * nm_log2_ceil(NM_M) + DIM * 8 * sizeof(elem_t) - 1) / (DIM * 8 * sizeof(elem_t)))
+static const size_t nm_spad_rows_per_tile = NM_SPAD_ROWS_PER_TILE_CALC;
+#ifdef GEMMINI_HW_NM_SPAD_ROWS_PER_TILE
+static_assert(GEMMINI_HW_NM_SPAD_ROWS_PER_TILE == NM_SPAD_ROWS_PER_TILE_CALC,
+              "GEMMINI_HW_NM_SPAD_ROWS_PER_TILE in gemmini_params.h disagrees with the tight index tile packing");
 #endif
 
 #define MAKECUSTOMFN(opcode) custom ## opcode
@@ -117,16 +134,23 @@ struct gemmini_state_t
   std::vector<std::vector<acc_t>> pe_state; // Stores each PE's internal accumulator state
   std::vector<std::vector<acc_t>> accumulator;
 
-  // n:m sparse mode stuff
-  // changed: added. meta cmds fill nm_asm row by row, finished DIM x DIM index tiles go in
-  // nm_meta_q, each real sparse preload pops one (like the rtl fifo).
-  // pe_meta is what the pes hold after a preload
+  // changed: added. N:M sparse state.
+  // Index commands fill nm_asm row by row; whole tiles queue in nm_meta_q and each real sparse preload pops one.
+  // The preload command latches its weights, indexes and mode (preload_*); the next compute_preloaded moves
+  // them into the PEs. nm_buf_sparse is the mode latched per RTL weight buffer; nm_buf is the one in use.
   bool nm_sparse;
   std::vector<std::vector<uint8_t>> nm_asm;
   size_t nm_asm_row;
   std::deque<std::vector<std::vector<uint8_t>>> nm_meta_q;
   std::vector<std::vector<uint8_t>> pe_meta;
-  std::vector<std::vector<uint8_t>> preload_meta; // what the last preload cmd grabbed
+  std::vector<std::vector<uint8_t>> preload_meta;
+  std::vector<std::vector<elem_t>> preload_d;
+  bool preload_real; // the last preload was not GARBAGE
+  bool preload_nm_sparse;
+  bool nm_buf_sparse[2];
+  unsigned nm_buf;
+  bool nm_tile_in_flight; // a real sparse preload popped a tile; like the RTL it counts against the FIFO until its compute
+  bool nm_ld_since_clear; // changed: Fix A, a scratchpad index load (rd == 2) since the last clear: register rows illegal
 
   // cisc state
   reg_t a_addr, b_addr, c_addr, d_addr;
@@ -151,6 +175,8 @@ public:
   void compute(reg_t a_addr, reg_t bd_addr, bool preload);
   void compute_cisc();
   void nm_meta_load(reg_t rs1, reg_t rs2); // changed: added
+  void nm_meta_clear(); // changed: added
+  void nm_meta_load_spad(reg_t rs1, reg_t rs2); // changed: Fix A
   reg_t counter_operation(reg_t rs1);
 
   void loop_ws(reg_t rs1, reg_t rs2);
@@ -186,7 +212,10 @@ private:
   const unsigned compute_accumulated_funct = 5;
   const unsigned preload_funct = 6;
   const unsigned flush_funct = 7;
-  const unsigned nm_meta_funct = 26; // changed: added, loads n:m index rows
+  const unsigned nm_meta_funct = 26; // changed: added, N:M index rows (rd == nm_meta_clear_rd: clear instead)
+  const unsigned nm_meta_clear_rd = 1; // changed: added
+  const unsigned nm_meta_push_rd = 0; // changed: Fix A, register rows (the original form)
+  const unsigned nm_meta_load_spad_rd = 2; // changed: Fix A, index tiles from the scratchpad; rd 3..31 reserved
   const unsigned loop_ws_funct = 8;
   const unsigned loop_ws_config_bounds_funct = 9;
   const unsigned loop_ws_config_addrs_AB_funct = 10;

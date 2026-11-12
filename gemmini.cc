@@ -14,6 +14,7 @@ REGISTER_EXTENSION(gemmini, []() { return new gemmini_t; })
 
 void gemmini_state_t::reset()
 {
+  *this = gemmini_state_t{}; // changed: zero every field first (acc_act and others were read uninitialised)
   enable = true;
   // mode = OS;
   // sys_act = NONE;
@@ -31,16 +32,11 @@ void gemmini_state_t::reset()
   pe_state.clear();
   pe_state.resize(DIM, std::vector<acc_t>(DIM));
 
-  // changed: reset the n:m sparse state too
-  nm_sparse = false;
-  nm_asm.clear();
-  nm_asm.resize(DIM, std::vector<uint8_t>(DIM));
-  nm_asm_row = 0;
-  nm_meta_q.clear();
-  pe_meta.clear();
-  pe_meta.resize(DIM, std::vector<uint8_t>(DIM));
-  preload_meta.clear();
-  preload_meta.resize(DIM, std::vector<uint8_t>(DIM));
+  // changed: added, the N:M tiles (the scalars are zeroed above)
+  nm_asm.assign(DIM, std::vector<uint8_t>(DIM, 0));
+  pe_meta.assign(DIM, std::vector<uint8_t>(DIM, 0));
+  preload_meta.assign(DIM, std::vector<uint8_t>(DIM, 0));
+  preload_d.assign(DIM, std::vector<elem_t>(DIM, 0));
 
   accumulator.clear();
   accumulator.resize(accum_rows, std::vector<acc_t>(DIM, 0));
@@ -52,24 +48,16 @@ void gemmini_state_t::reset()
 
   // Norm reset
   for (int i = 0; i < NORM_STAT_IDS; i++) norm_reset[i] = true;
-  norm_stat_id = 0; // changed: was never initialized, mvout from the acc indexes the norm arrays with it
 
   // Dummy counter reset
   snapshot_enable = false;
   op_in_progress = false;
-  // changed: these were never initialized, the first counter op reads them
-  for (size_t i = 0; i < NUM_COUNTERS; i++) {
-    counter_val[i] = 0;
-    counter_snapshot_val[i] = 0;
-    counter_config[i] = 0;
-    counter_external_flag[i] = false;
-  }
-  for (size_t i = 0; i < NUM_EXTERNAL_COUNTERS; i++) counter_external[i] = 0;
 
   resetted = true;
 
   printf("Gemmini extension configured with:\n");
   printf("    dim = %u\n", DIM);
+  printf("    n:m sparsity = %d:%d\n", NM_N, NM_M); // changed: added
 }
 
 void gemmini_t::reset() {
@@ -390,17 +378,34 @@ void gemmini_t::preload(reg_t bd_addr, reg_t c_addr) {
   dprintf("GEMMINI: preload - scratchpad output addr = 0x%08x, scratchpad preload addr = 0x%08x\n",
             gemmini_state.output_sp_addr, gemmini_state.preload_sp_addr);
 
-  // changed: a real sparse preload pops one index tile (matches the rtl fifo).
-  // zero/garbage preloads dont touch the fifo
-  if (gemmini_state.nm_sparse) {
-    if (~gemmini_state.preload_sp_addr == 0) {
-      for (auto & row : gemmini_state.preload_meta) std::fill(row.begin(), row.end(), 0);
-    } else if (gemmini_state.nm_meta_q.empty()) {
-      fprintf(stderr, "GEMMINI: sparse preload with no index tile queued, the rtl would hang here\n");
+  // changed: added. Like the RTL: a real sparse preload pops an index tile, others carry index 0; GARBAGE latches no mode.
+  const bool garbage = ~gemmini_state.preload_sp_addr == 0;
+  gemmini_state.preload_real = !garbage;
+  if (!garbage) {
+    // TODO: Handle preloads from accumulator, values are shifted and activated before preload
+    assert(((gemmini_state.preload_sp_addr >> 30) & 0b11) == 0); // Preloads from accumulator not supported
+    gemmini_state.preload_nm_sparse = gemmini_state.nm_sparse;
+  }
+  if (gemmini_state.nm_sparse && !garbage) {
+    if (gemmini_state.nm_meta_q.empty()) {
+      fprintf(stderr, "GEMMINI: sparse preload with no index tile queued: index tile must be sent before its preload\n");
       abort();
-    } else {
-      gemmini_state.preload_meta = gemmini_state.nm_meta_q.front();
-      gemmini_state.nm_meta_q.pop_front();
+    }
+    gemmini_state.preload_meta = gemmini_state.nm_meta_q.front();
+    gemmini_state.nm_meta_q.pop_front();
+    gemmini_state.nm_tile_in_flight = true;
+  } else {
+    for (auto & row : gemmini_state.preload_meta) std::fill(row.begin(), row.end(), 0);
+  }
+
+  // changed: moved here from compute(), so a later mvin to these rows can't change the weights
+  const bool preload_transpose = (gemmini_state.mode == gemmini_state_t::WS) && gemmini_state.b_transpose;
+  for (size_t i = 0; i < DIM; i++) {
+    for (size_t j = 0; j < DIM; j++) {
+      const size_t r = preload_transpose ? j : i;
+      const size_t c = preload_transpose ? i : j;
+      gemmini_state.preload_d.at(i).at(j) = (!garbage && i < gemmini_state.preload_rows && j < gemmini_state.preload_cols) ?
+        gemmini_state.spad.at(gemmini_state.preload_sp_addr + r).at(c) : 0;
     }
   }
 }
@@ -443,7 +448,7 @@ void gemmini_t::config(reg_t rs1, reg_t rs2) {
     new_b_transpose = (rs1 >> 9) & 0x1;
 
     const bool set_only_strides = (rs1 >> 7) & 0x1;
-    const bool new_nm_sparse = (rs1 >> 10) & 0x1; // changed: rs1[10] turns on n:m sparse mode
+    const bool new_nm_sparse = (rs1 >> 10) & 0x1; // changed: added, rs1[10] = N:M sparse mode
 
     dprintf("GEMMINI: config_ex - set dataflow mode from %d to %d\n", gemmini_state.mode, new_mode);
     dprintf("GEMMINI: config_ex - set activation function from %d to %d\n", gemmini_state.sys_act, new_act);
@@ -459,11 +464,18 @@ void gemmini_t::config(reg_t rs1, reg_t rs2) {
       gemmini_state.sys_acc_shift = new_sys_acc_shift;
       gemmini_state.a_transpose = new_a_transpose;
       gemmini_state.b_transpose = new_b_transpose;
-      gemmini_state.nm_sparse = new_nm_sparse; // changed: added
+      // changed: added
+      if (gemmini_state.nm_sparse && !new_nm_sparse && (gemmini_state.nm_asm_row != 0 || !gemmini_state.nm_meta_q.empty()))
+        fprintf(stderr, "GEMMINI: warning: sparse mode turned off with %zu index tiles and %zu index rows pending\n",
+                gemmini_state.nm_meta_q.size(), gemmini_state.nm_asm_row);
+      gemmini_state.nm_sparse = new_nm_sparse;
     }
 
-    // changed: sparse mode only makes sense in ws, and no transposes
-    assert(!gemmini_state.nm_sparse || (gemmini_state.mode == gemmini_state_t::WS && !gemmini_state.a_transpose && !gemmini_state.b_transpose));
+    // changed: added
+    if (gemmini_state.nm_sparse && !(gemmini_state.mode == gemmini_state_t::WS && !gemmini_state.a_transpose && !gemmini_state.b_transpose)) {
+      fprintf(stderr, "GEMMINI: sparse mode needs WS dataflow and no A/B transpose\n");
+      abort();
+    }
 
     gemmini_state.c_stride = new_c_stride;
     gemmini_state.a_stride = new_a_stride;
@@ -570,34 +582,27 @@ void gemmini_t::compute(reg_t a_addr, reg_t bd_addr, bool preload) {
   dprintf("GEMMINI: compute - preload = %d, scratchpad A addr = 0x%08x,"
            "scratchpad B addr 0x%08x\n", preload, a_addr_real, bd_addr_real);
 
-  // Preload
-  if (preload && gemmini_state.nm_sparse) {
-    // changed: indexes land in the pes together with the weights
-    gemmini_state.pe_meta = gemmini_state.preload_meta;
+  gemmini_state.nm_tile_in_flight = false; // changed: added, the RTL preload fires with this compute
+
+  // changed: added, the RTL feeds stale bank data for a GARBAGE A
+  if (gemmini_state.nm_sparse && ~a_addr_real == 0) {
+    fprintf(stderr, "GEMMINI: sparse compute with a GARBAGE A operand\n");
+    abort();
   }
+
+  // Preload
   if (preload) {
+    // changed: added. The next weight buffer takes the mode latched by a real preload; a GARBAGE one keeps its old mode.
+    gemmini_state.nm_buf ^= 1;
+    if (gemmini_state.preload_real) gemmini_state.nm_buf_sparse[gemmini_state.nm_buf] = gemmini_state.preload_nm_sparse;
+    gemmini_state.pe_meta = gemmini_state.preload_meta;
+
     dprintf("GEMMINI: compute - PEs after preloading:\n");
     for (size_t i = 0; i < DIM; i++) {
       for (size_t j = 0; j < DIM; j++) {
-        // TODO: Handle preloads from accumulator, values are shifted and activated before preload
-        if (~gemmini_state.preload_sp_addr != 0) {
-          assert(((gemmini_state.preload_sp_addr >> 30) & 0b11) == 0); // Preloads from accumulator not supported
-        }
-
-        bool preload_tranpose = (gemmini_state.mode == gemmini_state_t::WS) &&
-          gemmini_state.b_transpose;
-        size_t r = preload_tranpose ? j : i;
-        size_t c = preload_tranpose ? i : j;
-
         // In OS mode, pe_state stores the accumulator values
         // In WS mode, pe_state stores the persistent weight matrix
-        if (i < gemmini_state.preload_rows && j < gemmini_state.preload_cols) {
-          auto preload_value = (~gemmini_state.preload_sp_addr == 0) ? 0 :
-                  gemmini_state.spad.at(gemmini_state.preload_sp_addr + r).at(c);
-          gemmini_state.pe_state.at(i).at(j) = preload_value;
-        } else {
-          gemmini_state.pe_state.at(i).at(j) = 0;
-        }
+        gemmini_state.pe_state.at(i).at(j) = gemmini_state.preload_d.at(i).at(j); // changed: latched by preload()
 
 #ifdef ELEM_T_IS_FLOAT
         dprintf("%f ", gemmini_state.pe_state.at(i).at(j));
@@ -608,31 +613,33 @@ void gemmini_t::compute(reg_t a_addr, reg_t bd_addr, bool preload) {
       dprintf("\n");
     }
   }
+  // changed: added
+  if (gemmini_state.nm_buf_sparse[gemmini_state.nm_buf] != gemmini_state.nm_sparse) {
+    fprintf(stderr, "GEMMINI: %s compute on weights preloaded in %s mode\n",
+            gemmini_state.nm_sparse ? "sparse" : "dense", gemmini_state.nm_buf_sparse[gemmini_state.nm_buf] ? "sparse" : "dense");
+    abort();
+  }
 
   // Compute
   // For OS, accumulate the PE results internally in pe_state
   // For WS, allocate a new results array which won't affect pe_state, seed the results array with the bias (D) matrix
   auto results = std::vector<std::vector<acc_t>>(DIM, std::vector<acc_t>(DIM));
   if (gemmini_state.nm_sparse) {
-    // changed: n:m sparse ws compute
-    // a comes in as one dense row 2*DIM wide, split over two spad rows:
-    // a_addr holds cols 0..DIM-1 and bd_addr holds cols DIM..2*DIM-1 (no bias in this mode).
-    // pe row r holds a squashed weight from group r/n, its idx picks which of the
-    // m activations in that group it multiplies with
+    // changed: added. N:M sparse WS compute, no bias.
+    // A row i is 2*DIM wide: cols 0..DIM-1 at a_addr (rows a_stride apart), cols DIM..2*DIM-1 at bd_addr (rows 1 apart,
+    // like the RTL B port). PE (r, j) holds a kept weight of group r/n; its index picks one of the m activations.
     for (size_t i = 0; i < DIM; ++i) {
       for (size_t j = 0; j < DIM; ++j) {
         acc_t sum = 0;
         for (size_t r = 0; r < DIM; ++r) {
-          const size_t g = r / NM_N;
-          const size_t kd = g * NM_M + gemmini_state.pe_meta.at(r).at(j);
-          const size_t row = gemmini_state.a_stride * i;
+          const size_t kd = (r / NM_N) * NM_M + gemmini_state.pe_meta.at(r).at(j);
           elem_t a = 0;
           if (kd < DIM) {
-            if (~a_addr_real != 0 && i < a_rows && kd < a_cols)
-              a = gemmini_state.spad.at(a_addr_real + row).at(kd);
+            if (i < a_rows && kd < a_cols)
+              a = gemmini_state.spad.at(a_addr_real + gemmini_state.a_stride * i).at(kd);
           } else {
             if (~bd_addr_real != 0 && i < bd_rows && kd - DIM < bd_cols)
-              a = gemmini_state.spad.at(bd_addr_real + row).at(kd - DIM);
+              a = gemmini_state.spad.at(bd_addr_real + i).at(kd - DIM);
           }
           sum += a * gemmini_state.pe_state.at(r).at(j);
         }
@@ -682,7 +689,7 @@ void gemmini_t::compute(reg_t a_addr, reg_t bd_addr, bool preload) {
     }
   }
 
-dprintf("GEMMINI: compute - PEs after matmul:\n");
+  dprintf("GEMMINI: compute - PEs after matmul:\n");
   for (size_t i = 0; i < DIM; ++i) {
     for (size_t j = 0; j < DIM; ++j) {
 #ifdef ELEM_T_IS_FLOAT
@@ -738,15 +745,16 @@ dprintf("GEMMINI: compute - PEs after matmul:\n");
   }
 }
 
-// changed: added. n:m index rows for sparse preloads.
-// each index is log2(m) bits, a row is DIM of them packed low col first,
-// each 64 bit reg holds as many whole rows as fit, rs1 rows go first then rs2.
-// rows fill up one DIM x DIM tile at a time
+// changed: added. N:M index rows for sparse preloads.
+// Each index is log2(m) bits; a row is DIM of them, lowest column first; each 64-bit register holds as many
+// whole rows as fit, rs1's rows before rs2's. The rows fill one DIM x DIM tile at a time.
 void gemmini_t::nm_meta_load(reg_t rs1, reg_t rs2) {
-  size_t idx_bits = 0;
-  while ((1u << idx_bits) < NM_M) idx_bits++;
+  if (gemmini_state.nm_ld_since_clear) { // changed: Fix A, a scratchpad load may still wait for its mvins in the RTL
+    fprintf(stderr, "GEMMINI: NM_META_CMD register rows (rd == 0) after a scratchpad index load (rd == 2): gemmini_nm_reset() first\n");
+    abort();
+  }
+  const size_t idx_bits = nm_log2_ceil(NM_M);
   const size_t row_bits = DIM * idx_bits;
-  assert(row_bits <= 64);
   const size_t rows_per_reg = 64 / row_bits;
   const reg_t idx_mask = (1u << idx_bits) - 1;
 
@@ -763,6 +771,11 @@ void gemmini_t::nm_meta_load(reg_t rs1, reg_t rs2) {
   }
   // tile done once the rows run off the end, then it waits for a preload
   if (gemmini_state.nm_asm_row + 2 * rows_per_reg >= DIM) {
+    if (gemmini_state.nm_meta_q.size() + gemmini_state.nm_tile_in_flight >= (size_t)NM_META_FIFO_DEPTH) {
+      fprintf(stderr, "GEMMINI: index FIFO full (%d tiles): send at most %d tiles ahead of their preloads\n",
+              NM_META_FIFO_DEPTH, NM_META_FIFO_DEPTH);
+      abort();
+    }
     gemmini_state.nm_meta_q.push_back(gemmini_state.nm_asm);
     gemmini_state.nm_asm_row = 0;
   } else {
@@ -771,7 +784,91 @@ void gemmini_t::nm_meta_load(reg_t rs1, reg_t rs2) {
   dprintf("GEMMINI: nm_meta - %lu index tiles queued\n", gemmini_state.nm_meta_q.size());
 }
 
+// changed: added. Clear form of the index command: drop the half-built tile and empty the FIFO.
+void gemmini_t::nm_meta_clear() {
+  if (gemmini_state.nm_tile_in_flight) { // the RTL would flush the tile this preload still waits for
+    fprintf(stderr, "GEMMINI: index clear between a sparse preload and its compute: fence first\n");
+    abort();
+  }
+  gemmini_state.nm_asm_row = 0;
+  gemmini_state.nm_meta_q.clear();
+  gemmini_state.nm_ld_since_clear = false; // changed: Fix A
+  dprintf("GEMMINI: nm_meta - cleared\n");
+}
+
+// changed: Fix A. Load form of the index command (rd == 2): n = rs2[7:0] (1..4) index tiles from scratchpad rows
+// rs1[31:0] .. + n*R - 1, R = nm_spad_rows_per_tile, tile t at rows rs1 + t*R. A tile is one bit string S over its R
+// rows (byte j of a row = the byte the mvin read from src + j, lowest bit first); idx[r][c] = S[(r*DIM + c)*b .. +b-1],
+// b = log2(m). Tiles go to the back of the FIFO in order. Checks and messages as the RTL asserts (fix-a-spec.md 7).
+void gemmini_t::nm_meta_load_spad(reg_t rs1, reg_t rs2) {
+  const size_t b = nm_log2_ceil(NM_M);
+  const size_t R = nm_spad_rows_per_tile;
+  const size_t sp_rows = (size_t)BANK_NUM * BANK_ROWS;
+  const reg_t n = rs2 & 0xFF;
+  const reg_t addr = rs1 & 0xFFFFFFFF;
+  if (n < 1 || n > NM_META_FIFO_DEPTH) {
+    fprintf(stderr, "GEMMINI: NM_META_CMD rd == 2: tile count rs2[7:0] must be 1..4 (got %lu)\n", (unsigned long)n);
+    abort();
+  }
+  if ((rs1 >> 32) != 0 || (rs2 >> 8) != 0) {
+    fprintf(stderr, "GEMMINI: NM_META_CMD rd == 2: rs1[63:32] and rs2[63:8] must be 0 (rs1 0x%lx, rs2 0x%lx)\n",
+            (unsigned long)rs1, (unsigned long)rs2);
+    abort();
+  }
+  if (addr >= sp_rows) { // rs1[31:spAddrBits] != 0: an accumulator address or GARBAGE
+    fprintf(stderr, "GEMMINI: NM_META_CMD rd == 2: rs1 must be a scratchpad row address (not accumulator, not GARBAGE) (rs1 0x%lx)\n",
+            (unsigned long)rs1);
+    abort();
+  }
+  if (addr / BANK_ROWS != (addr + n * R - 1) / BANK_ROWS) {
+    fprintf(stderr, "GEMMINI: NM_META_CMD rd == 2: the index rows must all lie in one scratchpad bank (rows %lu..%lu)\n",
+            (unsigned long)addr, (unsigned long)(addr + n * R - 1));
+    abort();
+  }
+  if (gemmini_state.nm_asm_row != 0) {
+    fprintf(stderr, "GEMMINI: NM_META_CMD rd == 2 while a register-path index tile is half sent\n");
+    abort();
+  }
+  if (gemmini_state.nm_meta_q.size() + gemmini_state.nm_tile_in_flight + n > (size_t)NM_META_FIFO_DEPTH) {
+    fprintf(stderr, "GEMMINI: n:m index fifo: more than 4 index tiles ahead of their preloads (%lu queued, %d in flight, load of %lu)\n",
+            gemmini_state.nm_meta_q.size(), (int)gemmini_state.nm_tile_in_flight, (unsigned long)n);
+    abort();
+  }
+
+  const size_t row_bytes = DIM * sizeof(elem_t);
+  std::vector<std::vector<uint8_t>> tile(DIM, std::vector<uint8_t>(DIM, 0));
+  for (size_t t = 0; t < n; t++) {
+    std::vector<uint8_t> s(R * row_bytes, 0); // S as bytes, byte i = bits 8i..8i+7
+    for (size_t k = 0; k < R; k++) {
+      const auto & row = gemmini_state.spad.at(addr + t * R + k);
+      for (size_t j = 0; j < row_bytes; j++)
+        s[k * row_bytes + j] = (uint8_t)((uint64_t)row.at(j / sizeof(elem_t)) >> (8 * (j % sizeof(elem_t))));
+    }
+    for (size_t r = 0; r < DIM; r++) {
+      for (size_t c = 0; c < DIM; c++) {
+        const size_t p = (r * DIM + c) * b;
+        unsigned v = 0;
+        for (size_t q = 0; q < b; q++) v |= ((s[(p + q) / 8] >> ((p + q) % 8)) & 1u) << q;
+        tile.at(r).at(c) = v;
+      }
+    }
+    gemmini_state.nm_meta_q.push_back(tile);
+  }
+  gemmini_state.nm_ld_since_clear = true;
+  dprintf("GEMMINI: nm_meta - load of %lu index tiles from spad row 0x%lx, %lu queued\n", (unsigned long)n,
+          (unsigned long)addr, gemmini_state.nm_meta_q.size());
+}
+
+// changed: added, the loop unrollers send no index tiles
+static void nm_forbid_loop(const gemmini_state_t & st, const char * what) {
+  if (st.nm_sparse) {
+    fprintf(stderr, "GEMMINI: %s is not supported in sparse mode\n", what);
+    abort();
+  }
+}
+
 void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
+  nm_forbid_loop(gemmini_state, "LOOP_WS"); // changed: added
   const bool ex_accumulate = rs1 & 1;
   const bool full_C = (rs1 >> 1) & 1;
   const bool low_D = (rs1 >> 2) & 1;
@@ -1130,6 +1227,7 @@ void gemmini_t::loop_ws_config_strides_DC(reg_t rs1, reg_t rs2) {
 }
 
 void gemmini_t::loop_conv_ws(reg_t rs1, reg_t rs2) {
+  nm_forbid_loop(gemmini_state, "LOOP_CONV_WS"); // changed: added
   const bool no_bias = rs1 & 1;
   const bool wrot180 = (rs1 >> 1) & 1;
   const bool trans_output_1203 = (rs1 >> 2) & 1;
@@ -1700,7 +1798,13 @@ reg_t gemmini_t::CUSTOMFN(XCUSTOM_ACC)(rocc_insn_t insn, reg_t xs1, reg_t xs2) {
   } else if (insn.funct == loop_conv_ws_funct) {
     loop_conv_ws(xs1, xs2);
   } else if (insn.funct == nm_meta_funct) { // changed: added
-    nm_meta_load(xs1, xs2);
+    if (insn.rd == nm_meta_clear_rd) nm_meta_clear();
+    else if (insn.rd == nm_meta_push_rd) nm_meta_load(xs1, xs2);
+    else if (insn.rd == nm_meta_load_spad_rd) nm_meta_load_spad(xs1, xs2); // changed: Fix A
+    else { // changed: Fix A
+      fprintf(stderr, "GEMMINI: NM_META_CMD (funct 26): rd values 3..31 are reserved (rd = %u)\n", (unsigned)insn.rd);
+      abort();
+    }
   } else if (insn.funct == counter_op_funct) {
     return counter_operation(xs1);
   }
