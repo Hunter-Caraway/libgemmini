@@ -151,6 +151,8 @@ struct gemmini_state_t
   unsigned nm_buf;
   bool nm_tile_in_flight; // a real sparse preload popped a tile; like the RTL it counts against the FIFO until its compute
   bool nm_ld_since_clear; // changed: Fix A, a scratchpad index load (rd == 2) since the last clear: register rows illegal
+  uint64_t loop_ws_idx_dram; // changed: sparse-loop-fix, DRAM address of index tile 0 of the next sparse loop (funct 28)
+  bool loop_ws_nm_cfg_seen; // changed: sparse-loop-fix, a funct 28 since the last LOOP_WS (asserts N3, N4)
 
   // cisc state
   reg_t a_addr, b_addr, c_addr, d_addr;
@@ -177,6 +179,8 @@ public:
   void nm_meta_load(reg_t rs1, reg_t rs2); // changed: added
   void nm_meta_clear(); // changed: added
   void nm_meta_load_spad(reg_t rs1, reg_t rs2); // changed: Fix A
+  void load_idx(reg_t dram_addr, reg_t sp_addr); // changed: sparse-loop-fix, funct 27, mvin of index rows with fixed config
+  void loop_ws_config_nm(reg_t rs1, reg_t rs2); // changed: sparse-loop-fix, funct 28
   reg_t counter_operation(reg_t rs1);
 
   void loop_ws(reg_t rs1, reg_t rs2);
@@ -216,6 +220,8 @@ private:
   const unsigned nm_meta_clear_rd = 1; // changed: added
   const unsigned nm_meta_push_rd = 0; // changed: Fix A, register rows (the original form)
   const unsigned nm_meta_load_spad_rd = 2; // changed: Fix A, index tiles from the scratchpad; rd 3..31 reserved
+  const unsigned load_idx_funct = 27; // changed: sparse-loop-fix, LOAD_IDX_CMD (fix-b-spec.md 2.5.2)
+  const unsigned loop_ws_config_nm_funct = 28; // changed: sparse-loop-fix, LOOP_WS_CONFIG_NM (fix-b-spec.md 2.5.2)
   const unsigned loop_ws_funct = 8;
   const unsigned loop_ws_config_bounds_funct = 9;
   const unsigned loop_ws_config_addrs_AB_funct = 10;
