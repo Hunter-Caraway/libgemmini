@@ -1015,7 +1015,7 @@ void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
   const uint32_t nm_b_off = nm_ea; // changed: bank-split-fix, "straddle": B right after E, may cross into the second bank
   const uint32_t nm_o_off = nm_b_off + nm_bsz > BANK_ROWS ? nm_b_off + nm_bsz : BANK_ROWS; // changed: bank-split-fix, O after B, never below the second bank
   if (nm) // changed: bank-split-fix, sparse loop A map
-    B_sp_addr_start = A_sp_addr_start + nm_b_off; // changed: bank-split-fix, B after E (was: below the index region)
+    B_sp_addr_start = A_sp_addr_start + nm_b_off; // changed: bank-split-fix, B right after E (straddle placement)
 
   if (gemmini_state.loop_ws_D != 0) {
     for (uint16_t i = 0; i < I; i++) {
