@@ -954,7 +954,7 @@ void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
     if (gemmini_state.a_stride != 1) // changed: sparse-loop-fix, sparse loop sizes and legality checks
       nm_loop_abort("sparse loop needs A_stride == 1"); // changed: sparse-loop-fix, N8
     if (((size_t)I * K + (size_t)KB * J) * DIM + nm_idx_rows > (size_t)BANK_NUM * BANK_ROWS / 2 || nm_idx_rows > (size_t)BANK_ROWS) // changed: sparse-loop-fix, sparse loop sizes and legality checks
-      nm_loop_abort("A, B and index regions do not fit in the loop's scratchpad half (or index region exceeds one bank)"); // changed: sparse-loop-fix, N9
+      nm_loop_abort("A, B and index regions do not fit in the loop's scratchpad half (or index region exceeds one bank); bank-split-fix: even and odd A K tiles need one bank each"); // changed: sparse-loop-fix, N9; bank-split-fix, N9 text (spec Q6)
     if (!gemmini_state.nm_meta_q.empty() || gemmini_state.nm_tile_in_flight) // changed: sparse-loop-fix, sparse loop sizes and legality checks
       nm_loop_abort("sparse loop started with index tiles pending in the FIFO: gemmini_nm_reset() first"); // changed: sparse-loop-fix, N10
   } // changed: sparse-loop-fix, sparse loop sizes and legality checks
@@ -1005,6 +1005,18 @@ void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
     return;
   }
 
+  // changed: bank-split-fix. Sparse loop A map (bank-split-fix-spec.md 2.1), rows from A's start (a half starts a bank): E = even K tiles
+  // changed: bank-split-fix, (a_lo) at [0, ea), O = odd K tiles (a_hi) at [o_off, o_off + ea), B at [b_off, b_off + bsz), index rows at the top
+  // changed: bank-split-fix, of the half as before. B placement "straddle" (spec Q4) is the pair nm_b_off / nm_o_off, as in the RTL; under N9 it
+  // changed: bank-split-fix, keeps E in the first bank and O in the second. Another placement needs its own N9 rule.
+  const uint32_t nm_idx_sp_addr_start = B_sp_addr_start + KB * J * DIM; // changed: sparse-loop-fix, index mvins and LOADs of the sparse loop; bank-split-fix, taken before B moves
+  const uint32_t nm_ea = (uint32_t)I * KB * DIM; // changed: bank-split-fix, rows of E (and of O)
+  const uint32_t nm_bsz = (uint32_t)KB * J * DIM; // changed: bank-split-fix, rows of B
+  const uint32_t nm_b_off = nm_ea; // changed: bank-split-fix, "straddle": B right after E, may cross into the second bank
+  const uint32_t nm_o_off = nm_b_off + nm_bsz > BANK_ROWS ? nm_b_off + nm_bsz : BANK_ROWS; // changed: bank-split-fix, O after B, never below the second bank
+  if (nm) // changed: bank-split-fix, sparse loop A map
+    B_sp_addr_start = A_sp_addr_start + nm_b_off; // changed: bank-split-fix, B after E (was: below the index region)
+
   if (gemmini_state.loop_ws_D != 0) {
     for (uint16_t i = 0; i < I; i++) {
       for (uint16_t j = 0; j < J; j++) {
@@ -1025,7 +1037,6 @@ void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
 
   // changed: sparse-loop-fix. Index rows and LOADs follow the RTL policy (fix-b-spec.md 1.5): LOAD_IDX mvins of nm_g
   // changed: sparse-loop-fix, tiles cover a LOAD before it is issued; the LOAD is the Fix A command, so its budget and bank aborts stay live.
-  const uint32_t nm_idx_sp_addr_start = B_sp_addr_start + KB * J * DIM; // changed: sparse-loop-fix, index mvins and LOADs of the sparse loop
   auto nm_loop_load = [&](size_t n) { // changed: sparse-loop-fix, index mvins and LOADs of the sparse loop
     while (nm_idx_issued < nm_loaded + n) { // changed: sparse-loop-fix, index mvins and LOADs of the sparse loop
       const uint64_t rows = (nm_tiles - nm_idx_issued < nm_g ? nm_tiles - nm_idx_issued : nm_g) * nm_R; // changed: sparse-loop-fix, index mvins and LOADs of the sparse loop
@@ -1044,7 +1055,9 @@ void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
     for (uint16_t j = 0; j < J; j++) {
       for (uint16_t i = 0; i < I; i++) {
         const uint32_t A_sp_addr = a_transpose ? (A_sp_addr_start + (k*I + i)*DIM) :
+          nm ? (A_sp_addr_start + (i*KB + k)*DIM) : // changed: bank-split-fix, a_lo = A tile (i, 2k) in the E region
           (A_sp_addr_start + (i*K + ka)*DIM); // changed: sparse-loop-fix, A keeps the original K layout
+        const uint32_t A_hi_sp_addr = A_sp_addr + nm_o_off; // changed: bank-split-fix, a_hi = A tile (i, 2k+1) in the O region (sparse loop only)
         const uint32_t B_sp_addr = b_transpose ? (B_sp_addr_start + (j*K + k)*DIM) :
           (B_sp_addr_start + (k*J + j)*DIM);
         const uint32_t C_sp_addr = C_sp_addr_start + (i*J + j)*DIM;
@@ -1067,7 +1080,7 @@ void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
 
           mvin(dram_addr, (rows << 48) | (cols << 32) | A_sp_addr, 0);
           if (nm) // changed: sparse-loop-fix, the high half of the activations: A K tile 2k+1, the next tile in DRAM and scratchpad
-            mvin(dram_addr + DIM * sizeof(elem_t), (rows << 48) | (cols << 32) | (A_sp_addr + DIM), 0); // changed: sparse-loop-fix, second A tile of the sparse loop
+            mvin(dram_addr + DIM * sizeof(elem_t), (rows << 48) | (cols << 32) | A_hi_sp_addr, 0); // changed: sparse-loop-fix, second A tile of the sparse loop; bank-split-fix, to the O region
         }
 
         // Mvin B
@@ -1108,8 +1121,13 @@ void gemmini_t::loop_ws(reg_t rs1, reg_t rs2) {
           preload((B_rows << 48) | (B_cols << 32) | pre_sp_addr,
               (C_rows << 48) | (C_cols << 32) | out_sp_addr);
 
+          // changed: bank-split-fix, BS3 (RTL assert text): the loop's own constants must put a_lo and a_hi in different banks (mutant M1 breaks it)
+          if (nm && A_sp_addr / BANK_ROWS == A_hi_sp_addr / BANK_ROWS) { // changed: bank-split-fix, BS3
+            fprintf(stderr, "GEMMINI: bank-split-fix: internal: a_lo and a_hi of a sparse loop compute are in the same scratchpad bank\n"); // changed: bank-split-fix, BS3
+            abort(); // changed: bank-split-fix, BS3
+          } // changed: bank-split-fix, BS3
           compute((A_rows << 48) | (A_cols << 32) | A_sp_addr,
-              nm ? (A_rows << 48) | ((uint64_t)DIM << 32) | (A_sp_addr + DIM) : // changed: sparse-loop-fix, rs2 = a_hi (A K tile 2k+1), a_rows rows
+              nm ? (A_rows << 48) | ((uint64_t)DIM << 32) | A_hi_sp_addr : // changed: sparse-loop-fix, rs2 = a_hi (A K tile 2k+1), a_rows rows; bank-split-fix, from the O region
               ((uint64_t)DIM << 48) | ((uint64_t)DIM << 32) | GARBAGE_ADDR, i == 0);
 
           // changed: sparse-loop-fix. Rolling batch of 2 after the last compute of tile u = k*J + j (pre = u + 1 preloads done)
